@@ -62,6 +62,14 @@ AUTO_REPLY_PATTERNS = [
     r"out of office",
     r"currently unavailable",
     r"will get back to you",
+    r"away from my phone",
+    r"please leave a message",
+    r"cannot take your call",
+    r"get back to you as soon as possible",
+    r"our working hours are",
+    r"we have received your message",
+    r"thanks for your message",
+    r"we will respond",
 ]
 
 def is_auto_reply(message: str) -> bool:
@@ -495,7 +503,7 @@ class ConversationState:
         return [t["body"] for t in self.turns if t["from"] in ("merchant", "customer")]
 
 
-def respond(state: ConversationState, merchant_message: str) -> dict:
+def respond(state: ConversationState, merchant_message: str, from_role: str = "merchant") -> dict:
     """
     Handle a reply from the merchant/customer in an ongoing conversation.
     Returns: { action: "send"|"wait"|"end", body?, cta?, rationale }
@@ -503,48 +511,39 @@ def respond(state: ConversationState, merchant_message: str) -> dict:
     # Auto-reply detection
     if is_auto_reply(merchant_message):
         state.auto_reply_count += 1
-        if state.auto_reply_count == 1:
-            # First auto-reply: one soft retry
+        if state.auto_reply_count <= 3:
             return {
-                "action": "send",
-                "body": (
-                    f"Samajh gayi — message team tak pahunch gaya. "
-                    f"Kya aap directly dekhna chahenge ki exact kya improve ho sakta hai? "
-                    f"2 minute ka kaam hai. Chalega?"
-                ),
-                "cta": "binary_yes_stop",
-                "rationale": "First auto-reply detected; one soft retry to reach the human.",
+                "action": "wait",
+                "wait_seconds": 3600,
+                "rationale": f"Auto-reply detected. Waiting {state.auto_reply_count} hours before retry."
             }
         else:
-            # Second auto-reply: graceful exit
             state.ended = True
-            mname = _name(state.merchant)
             return {
                 "action": "end",
-                "rationale": f"Repeated auto-reply confirmed ({state.auto_reply_count}×). Gracefully exiting — no point burning turns.",
+                "rationale": "Too many auto-replies. Ending conversation gracefully."
             }
 
-    state.add_turn("merchant", merchant_message)
+    state.add_turn(from_role, merchant_message)
     intent = detect_intent(merchant_message)
 
     # Explicit negative: graceful exit
     if intent == "negative":
         state.ended = True
-        mname = _name(state.merchant)
         return {
             "action": "end",
-            "rationale": "Merchant signalled not-interested. Exiting gracefully to preserve relationship.",
+            "rationale": f"{from_role.capitalize()} signalled not-interested. Exiting gracefully to preserve relationship.",
         }
 
     # Explicit positive intent: action mode — deliver the artifact, don't qualify further
     if intent == "positive":
-        return _action_mode_reply(state, merchant_message)
+        return _action_mode_reply(state, merchant_message, from_role)
 
     # Neutral / question: use Claude to reply naturally
-    return _neutral_reply(state, merchant_message)
+    return _neutral_reply(state, merchant_message, from_role)
 
 
-def _action_mode_reply(state: ConversationState, message: str) -> dict:
+def _action_mode_reply(state: ConversationState, message: str, from_role: str) -> dict:
     """Merchant said YES — deliver the artifact or confirm the action."""
     kind     = state.trigger.get("kind", "generic")
     merchant = state.merchant
@@ -559,7 +558,24 @@ def _action_mode_reply(state: ConversationState, message: str) -> dict:
         f"[{t['from'].upper()}]: {t['body']}" for t in state.turns[-6:]
     )
 
-    user = f"""The merchant ({mname}) has replied positively to your message. They want to proceed.
+    if from_role == "customer":
+        user = f"""The customer ({state.customer.get('identity', {}).get('name') if state.customer else 'Customer'}) has replied positively to the message.
+
+CONVERSATION SO FAR:
+{history_str}
+[CUSTOMER]: {message}
+
+MERCHANT CONTEXT: {json.dumps({'identity': merchant.get('identity'), 'offers': merchant.get('offers', [])[:3], 'signals': merchant.get('signals', [])}, ensure_ascii=False)}
+TRIGGER KIND: {kind}
+
+TASK: The customer said YES. Switch from pitch mode to action mode immediately.
+- Do NOT ask another qualifying question.
+- Reply to the CUSTOMER on behalf of the merchant.
+- Keep it concrete and under 120 words.
+
+Output JSON: {{"action": "send", "body": "...", "cta": "open_ended"|"none", "send_as": "merchant_on_behalf", "rationale": "..."}}"""
+    else:
+        user = f"""The merchant ({mname}) has replied positively to your message. They want to proceed.
 
 CONVERSATION SO FAR:
 {history_str}
@@ -596,7 +612,7 @@ Output JSON: {{"action": "send", "body": "...", "cta": "open_ended"|"none", "rat
         return {"action": "send", "body": raw, "cta": "open_ended", "rationale": "Action mode response."}
 
 
-def _neutral_reply(state: ConversationState, message: str) -> dict:
+def _neutral_reply(state: ConversationState, message: str, from_role: str) -> dict:
     """Merchant asked a question or gave a neutral response — answer naturally."""
     merchant = state.merchant
     category = state.category
@@ -617,7 +633,25 @@ def _neutral_reply(state: ConversationState, message: str) -> dict:
         "customer_aggregate": merchant.get("customer_aggregate"),
     }
 
-    user = f"""You are mid-conversation with merchant {mname}.
+    if from_role == "customer":
+        user = f"""You are acting on behalf of the merchant ({mname}) mid-conversation with the customer ({state.customer.get('identity', {}).get('name') if state.customer else 'Customer'}).
+
+CONVERSATION:
+{history_str}
+[CUSTOMER]: {message}
+
+MERCHANT DATA: {json.dumps(merchant_ctx, ensure_ascii=False)}
+CATEGORY: {category.get('slug')}
+
+TASK: Reply to the customer's message on behalf of the merchant.
+- Answer their question/comment grounded in the context data.
+- Don't restart the pitch. Continue naturally.
+- Keep it under 80 words.
+- Know when to end: if they're disengaging, respond with action=end.
+
+Output JSON: {{"action": "send"|"wait"|"end", "body": "...", "cta": "open_ended"|"none"|"binary_yes_stop", "send_as": "merchant_on_behalf", "rationale": "..."}}"""
+    else:
+        user = f"""You are mid-conversation with merchant {mname}.
 
 CONVERSATION:
 {history_str}

@@ -154,8 +154,14 @@ async def tick(body: TickBody):
             logger.info(f"Suppressing duplicate: {suppression_key}")
             continue
 
-        merchant_id = trg_payload.get("merchant_id")
-        customer_id = trg_payload.get("customer_id")
+        # Safely extract IDs which might be top-level, named target_*, or nested inside a "payload" object
+        merchant_id = trg_payload.get("merchant_id") or trg_payload.get("target_merchant_id")
+        if not merchant_id and isinstance(trg_payload.get("payload"), dict):
+            merchant_id = trg_payload["payload"].get("merchant_id") or trg_payload["payload"].get("target_merchant_id")
+
+        customer_id = trg_payload.get("customer_id") or trg_payload.get("target_customer_id")
+        if not customer_id and isinstance(trg_payload.get("payload"), dict):
+            customer_id = trg_payload["payload"].get("customer_id") or trg_payload["payload"].get("target_customer_id")
 
         if not merchant_id:
             continue
@@ -260,7 +266,7 @@ async def reply(body: ReplyBody):
         return {"action": "end", "rationale": "Conversation already ended."}
 
     try:
-        result = Bot.respond(state, body.message)
+        result = Bot.respond(state, body.message, body.from_role)
     except Exception as e:
         logger.error(f"Reply error conv={conv_id}: {e}")
         return {"action": "send", "body": "Got it — let me get back to you shortly.", "cta": "none", "rationale": f"Error handled: {e}"}
